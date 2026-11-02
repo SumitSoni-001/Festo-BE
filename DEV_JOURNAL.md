@@ -188,6 +188,33 @@ Verified by actually recreating the containers (`docker compose up -d`) and conf
 
 ---
 
+## 13. `auth` module — register, verify-otp, login, refresh, logout
+
+Full vertical slice: `common/security/JwtService.java` + `JwtAuthFilter.java`, `auth/OtpService.java`, `auth/RefreshTokenStore.java`, `auth/EmailService.java` + `ConsoleEmailService.java` (stub), `auth/dto/*`, `auth/AuthService.java`, `auth/AuthController.java`, and a real `common/config/SecurityConfig.java` replacing the permit-all placeholder.
+
+**Decision — refresh tokens are JWTs, not opaque UUIDs.** Neither DB Design nor System Architecture actually spell out how `/refresh` finds *which user* a presented token belongs to, given Redis is keyed `refresh:<user_id>` (so you need the user id before you can look anything up) and the client only sends the token itself. Fix: refresh tokens are JWTs too (7 day expiry, `sub` = user id), signed with the same secret as access tokens. `/refresh` and `/logout` parse the token to get the user id, then check it against what's stored at `refresh:<user_id>` — self-describing token, still keyed by user id in Redis exactly as documented.
+
+**Decision — pending registration held in Redis, not the DB.** `POST /register` doesn't create a `users` row — per API Design, the account only gets created on `POST /verify-otp`. So `name`/`phone`/`passwordHash` from the register call have to live somewhere between the two requests. Stored as a Redis hash (`pending_registration:<email>`, same 10 min TTL as the OTP), deleted once the account's created.
+
+**Decision — `EmailService` interface + `ConsoleEmailService` stub.** The DIP pattern discussed earlier, applied for real: OTPs are logged to console instead of emailed. Swap in a Brevo-backed implementation once API keys exist — nothing else in `AuthService` changes.
+
+**Bug caught by actually running it:** `AuthService` originally used `com.fasterxml.jackson.databind.ObjectMapper` to JSON-serialize the pending registration data for Redis. App failed to start — `No qualifying bean of type 'com.fasterxml.jackson.databind.ObjectMapper'`. Traced it: this Spring Boot version (4.1.2) auto-configures Jackson 3's `ObjectMapper` (new `tools.jackson.*` groupId, pulled in transitively by Flyway) instead of the classic `com.fasterxml.jackson.*` one — a version/groupId split past what either of us had seen before. Rather than chase down the right import for an unfamiliar library version, removed the Jackson dependency entirely: switched pending-registration storage to a plain Redis hash (`opsForHash`), which only needs strings. Simpler fix than the "correct" import would have been anyway.
+
+**Deliberately not built yet** (simple scope, not forgotten):
+- Rate limiting / `TOO_MANY_OTP_ATTEMPTS` — needs its own infrastructure, not an auth-module concern
+- `roll_number` fallback registration path (SRS 6.3) — the `users` table has no column for it; main college-email-OTP path doesn't need it
+- Hard-rejecting unrecognised college domains — registration allows a personal-email path by design, so no `COLLEGE_DOMAIN_NOT_RECOGNISED` error exists
+
+**Verified end-to-end with curl against the real running app** (not just compiled):
+- `register` → `202`, OTP visible in console log → `verify-otp` → `200`, user created, tokens issued
+- `login` with correct password → `200`; wrong password → `401 INVALID_CREDENTIALS` (exact `ErrorResponse` shape)
+- `refresh` → new token pair; `logout` → `204`, then reusing that same refresh token → `401 INVALID_REFRESH_TOKEN` (confirms revocation actually works, not just that the endpoint returns 204)
+- Unauthenticated request to an unmapped path → `403`, not Spring MVC's default `404` — confirms the filter chain is actually intercepting requests, not just configured
+- Checked Postgres directly: `users` row correct, `is_email_verified = true`
+- Checked Redis directly: no leftover `otp:`/`pending_registration:` keys after verify, no `refresh:` key after logout
+
+---
+
 ## Key decisions — quick reference
 
 | # | Decision | Why |
@@ -205,9 +232,13 @@ Verified by actually recreating the containers (`docker compose up -d`) and conf
 | 11 | Festo runs on port 8081, not 8080 | Avoided killing an unrelated pre-existing process rather than assuming it was safe to |
 | 12 | Branch kept as `master` | No functional difference from `main` — convention only |
 | 13 | `User` entity mapped to table `users` | `user` is a reserved word in Postgres — `ddl-auto=update` silently failed to create it otherwise |
+| 14 | Refresh tokens are JWTs, not opaque UUIDs | `/refresh` only gets the token itself — it has to be self-describing to find the user id before checking Redis |
+| 15 | Pending registration stored in Redis, not DB | Account isn't created until OTP is verified, but register's name/phone/password need to survive until then |
+| 16 | `EmailService` interface + console stub | DIP in practice — swap in real Brevo later with zero `AuthService` changes |
+| 17 | Pending-registration storage uses Redis hash, not JSON | This Boot version auto-configures Jackson 3's `ObjectMapper` (different groupId) — sidestepped by not needing JSON at all |
 
 ---
 
 ## What's next
 
-The `auth` module itself: `JwtService`, `OtpService` (Redis-backed), a stub `EmailService` (real Brevo adapter later), the five auth endpoints (register/verify-otp/login/refresh/logout), then a real `SecurityConfig` with `JwtAuthFilter` replacing today's placeholder. See chat history / System Architecture.pdf Section 4 for the full build order after that.
+`auth` module is done and verified end-to-end. Next per the build order: `organisation` (+ `org_member`, `invitation`, `organizer_application`) — depends on `user` and `college`, both of which now exist. See chat history / System Architecture.pdf Section 4 for the full build order after that.
